@@ -1,16 +1,11 @@
 import re
 import random
 from datetime import datetime, timedelta
-from urllib.parse import urlparse, quote_plus
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-
-try:
-    from ddgs import DDGS
-except Exception:
-    from duckduckgo_search import DDGS
 
 app = FastAPI()
 app.add_middleware(
@@ -23,68 +18,69 @@ app.add_middleware(
 GMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@gmail\.com", re.I)
 PHONE_RE = re.compile(r"(?:\+?\d{1,3}[\s.-]?)?(?:\(?\d{2,4}\)?[\s.-]?)?\d{3,4}[\s.-]?\d{4}")
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept-Language": "en-US,en;q=0.9",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 }
 
-BLOCKED = (
-    "facebook.com", "instagram.com", "tiktok.com", "linkedin.com", "youtube.com",
-    "twitter.com", "x.com", "pinterest.com", "amazon.com", "jumia.", "konga.",
-    "bing.com", "yahoo.com", "google.com", "duckduckgo.com", "wikipedia.org",
-    "reddit.com", "quora.com", "yelp.com", "trustpilot.com", "shopify.com"
-)
+def get_new_domains_from_crt(niche: str, limit: int = 120):
+    domains = []
+    seen = set()
+    keywords = [w.strip().lower() for w in re.split(r"[,/\s]+", niche) if len(w.strip()) >= 3]
+    if not keywords:
+        keywords = ["shop", "store"]
 
-def bing_search(query: str, max_hits: int = 40):
-    hits = []
-    for first in range(1, max_hits, 10):
-        try:
-            url = f"https://bing.com{quote_plus(query)}&first={first}"
-            r = requests.get(url, headers=HEADERS, timeout=8)
-            if r.status_code != 200:
-                break
-            soup = BeautifulSoup(r.text, "html.parser")
-            items = soup.select("li.b_algo")
-            if not items:
-                break
-            for item in items:
-                a = item.select_one("h2 a")
-                p = item.select_one(".b_caption p")
-                if a and a.get("href", "").startswith("http"):
-                    hits.append({
-                        "title": a.get_text(" ", strip=True),
-                        "href": a["href"],
-                        "body": p.get_text(" ", strip=True) if p else ""
-                    })
-        except Exception:
+    # Query newly issued SSL certificates for stores & niche keywords
+    patterns = [f"%.myshopify.com"] + [f"%{kw}%.shop" for kw in keywords[:2]] + [f"%{kw}%.store" for kw in keywords[:2]]
+    for pat in patterns:
+        if len(domains) >= limit * 3:
             break
-    return hits
-
-def run_search(query: str, max_hits: int = 45):
-    out = []
-    try:
-        with DDGS() as ddgs:
-            for h in ddgs.text(query, max_results=max_hits):
-                out.append(h)
-    except Exception:
-        pass
-    if len(out) < 10:
-        out.extend(bing_search(query, max_hits=max_hits))
-    return out
-
-def scan_site(url: str):
-    emails = []
-    phones = []
-    base = url.rstrip("/")
-    for path in ["", "/pages/contact", "/contact"]:
         try:
-            r = requests.get(base + path, headers=HEADERS, timeout=4)
+            url = f"https://crt.sh{pat}&output=json"
+            r = requests.get(url, headers=HEADERS, timeout=12)
             if r.status_code != 200:
                 continue
-            text = BeautifulSoup(r.text, "html.parser").get_text(" ")
+            entries = r.json()
+            for item in entries:
+                if len(domains) >= limit * 3:
+                    break
+                name_val = str(item.get("common_name") or item.get("name_value") or "").lower().strip()
+                for raw_d in name_val.splitlines():
+                    d = raw_d.replace("*.", "").strip()
+                    if not d or "." not in d or d in seen:
+                        continue
+                    if any(skip in d for skip in ("shopify.com", "myshopify.com", "cloudflare", "amazonaws", "staging", "dev.", "test.")):
+                        if not d.endswith(".myshopify.com") or d.count(".") != 2:
+                            continue
+                    seen.add(d)
+                    ts = item.get("entry_timestamp") or item.get("not_before") or ""
+                    domains.append((d, ts))
+        except Exception:
+            continue
+    return domains
+
+def check_single_store(domain_info, niche: str, country: str):
+    domain, ts = domain_info
+    base = f"https://{domain}"
+    emails = []
+    phones = []
+    title = domain.split(".")[0].replace("-", " ").title()
+
+    for path in ["", "/pages/contact", "/contact"]:
+        try:
+            r = requests.get(base + path, headers=HEADERS, timeout=4, allow_redirects=True)
+            if r.status_code != 200:
+                continue
+            soup = BeautifulSoup(r.text, "html.parser")
+            if path == "" and soup.title and soup.title.string:
+                t = soup.title.string.strip()
+                if t and len(t) > 2:
+                    title = t.split("|")[0].split("-")[0].strip()[:45]
+
+            text = soup.get_text(" ")
             for e in GMAIL_RE.findall(text):
                 low = e.lower()
-                if not low.startswith(("example", "test", "email", "yourname", "user")) and low not in emails:
+                if not low.startswith(("example", "test", "email", "yourname", "user", "info@example")) and low not in emails:
                     emails.append(low)
+
             if not phones:
                 for p in PHONE_RE.findall(text):
                     digits = re.sub(r"\D", "", p)
@@ -95,7 +91,25 @@ def scan_site(url: str):
                 break
         except Exception:
             continue
-    return emails, phones
+
+    if not emails:
+        return None
+
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "")) if ts else datetime.now() - timedelta(hours=random.randint(1, 24))
+    except Exception:
+        dt = datetime.now() - timedelta(hours=random.randint(1, 24))
+
+    return {
+        "name": title or domain,
+        "website": base,
+        "email": emails[0],
+        "phone": phones[0] if phones else "Not listed",
+        "niche": niche,
+        "country": country,
+        "location": country,
+        "launched": dt.strftime("%b %d, %Y • %I:%M %p"),
+    }
 
 @app.get("/")
 def home():
@@ -113,74 +127,28 @@ async def scout(request: Request):
 
     niche = str(data.get("niche") or data.get("industry") or "fashion").strip()
     raw_country = data.get("country") or data.get("countries") or data.get("location") or "Global"
-    mode = str(data.get("type") or data.get("mode") or "store").lower()
-    target = min(int(data.get("limit", 100)), 120)
+    target = min(int(data.get("limit", 100)), 110)
 
     if isinstance(raw_country, list):
         countries = [str(c).strip() for c in raw_country if str(c).strip()]
     else:
         countries = [c.strip() for c in str(raw_country).split(",") if c.strip()]
-
     if not countries or any("all" in c.lower() or "global" in c.lower() for c in countries):
         countries = ["Global"]
 
-    queries = []
-    for c in countries[:6]:
-        c_tag = "" if c.lower() == "global" else f'"{c}"'
-        if "business" in mode:
-            queries.append(f'{niche} {c_tag} "@gmail.com" contact')
-            queries.append(f'{niche} company {c_tag} "@gmail.com"')
-        else:
-            queries.append(f'site:myshopify.com {niche} {c_tag} "@gmail.com"')
-            queries.append(f'"powered by shopify" {niche} {c_tag} "@gmail.com"')
-            queries.append(f'{niche} online store {c_tag} "@gmail.com"')
-
-    seen = set()
+    candidates = get_new_domains_from_crt(niche, limit=target)
     results = []
-    for q in queries:
-        if len(results) >= target:
-            break
-        for hit in run_search(q, max_hits=45):
-            if len(results) >= target:
-                break
-            u = hit.get("href", "")
-            if not u.startswith("http"):
-                continue
-            p = urlparse(u)
-            dom = p.netloc.lower().replace("www.", "")
-            if any(b in dom for b in BLOCKED) or dom in seen:
-                continue
-            seen.add(dom)
 
-            base = f"{p.scheme}://{p.netloc}"
-            emails = []
-            for se in GMAIL_RE.findall(hit.get("body", "") + " " + hit.get("title", "")):
-                low = se.lower()
-                if not low.startswith(("example", "test", "email")) and low not in emails:
-                    emails.append(low)
-
-            scraped_emails, phones = scan_site(base)
-            for se in scraped_emails:
-                if se not in emails:
-                    emails.append(se)
-
-            if not emails:
-                continue
-
-            matched_country = countries[len(results) % len(countries)]
-            dt = datetime.now() - timedelta(hours=random.randint(1, 36))
-            raw_title = hit.get("title", dom)
-            first_part = raw_title.split("|").split("-").strip()[:45]
-
-            results.append({
-                "name": first_part or dom,
-                "website": base,
-                "email": emails,
-                "phone": phones if phones else "Not listed",
-                "niche": niche,
-                "country": matched_country,
-                "location": matched_country,
-                "launched": dt.strftime("%b %d, %Y • %I:%M %p"),
-            })
+    with ThreadPoolExecutor(max_workers=20) as pool:
+        futures = [
+            pool.submit(check_single_store, cand, niche, countries[idx % len(countries)])
+            for idx, cand in enumerate(candidates[:250])
+        ]
+        for fut in as_completed(futures):
+            lead = fut.result()
+            if lead:
+                results.append(lead)
+                if len(results) >= target:
+                    break
 
     return results
